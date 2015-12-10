@@ -1,0 +1,1034 @@
+// File: MOESI.cpp
+//              
+// Tutorial implementation for Advances in Computer Architecture Lab session
+// Implements a simple CPU and memory simulation with randomly generated
+// read and write requests
+//
+// Author(s): Michiel W. van Tol, Mike Lankamp, Jony Zhang, 
+//            Konstantinos Bousias
+// Copyright (C) 2005-2009 by Computer Systems Architecture group, 
+//                            University of Amsterdam
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+//
+*/
+
+#include <systemc.h>
+#include <aca2009.h>
+#include <fstream>
+
+using namespace std;
+
+#define READ_MODE 0
+#define WRITE_MODE 1
+
+#define DEBUG 1
+#define DEBUG_CPU 0
+#define DEBUG_CACHE 1
+#define DEBUG_BUS 0
+#define DEBUG_COHERENCE 1
+
+static const int MEM_SIZE = 32768;   // 32kB = 32 x 1024 Byte
+static const int LINE_SIZE = 32;     // 32B Line size
+static const int ASSOCIATIVITY = 8;  // 8 way set assosiative
+static const int N_SET = MEM_SIZE/(LINE_SIZE*ASSOCIATIVITY); // 128 Lines
+
+
+enum Line_State {
+    MODIFIED    = 1,
+    OWNED       = 2,
+    EXCLUSIVE   = 3,
+    SHARED      = 4,
+    INVALID     = 5
+};
+
+enum Port_Data {
+    ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
+};
+// Cache line should have Tag, Status bit and Data
+typedef struct {
+    sc_int<32> data[8];
+    Line_State line_state;
+    unsigned int tag : 20;     
+}l1_cache_way;
+
+// We need LRU for each set
+typedef struct {
+    l1_cache_way way[ASSOCIATIVITY];
+    unsigned int lru : 7;
+}l1_cache_set;
+
+typedef struct {
+    sc_int<32> data;
+    Line_State line_state;
+    int address;
+}data_lookup;
+
+int pending_processors, CtoCtransfers, probeRead, probeWrite;
+class Cache;
+
+/* Bus interface, modified version from assignment. */
+class Bus_if : public virtual sc_interface 
+{
+    public:
+        virtual bool read(int writer, int addr) = 0;
+        //virtual bool write(int writer, int addr, int data) = 0;
+        virtual bool readX(int writer, int addr) = 0;
+        virtual bool upgrade(int writer, int addr) = 0;
+        virtual bool unlock_bus(int writer) = 0;
+};
+
+/* Cache module, simulates the cache. */
+SC_MODULE(Cache) 
+{
+
+public:
+    /* Function type. */
+    enum Function 
+    {
+        F_INVALID   = 0,
+        F_READ      = 1,
+        F_READX     = 2,
+        F_UPGRADE   = 3,
+        F_WRITE     = 4
+    };
+
+    /* Return code to CPU. */
+    enum RetCode 
+    {
+        RET_READ_DONE,
+        RET_WRITE_DONE,
+    };
+
+    /* In/Out ports with the cpu, as you did in assignment 1 */
+    sc_in<bool>     Port_CLK;
+    sc_in<Function> Port_Func;
+    sc_in<int>      Port_Addr;
+    sc_out<RetCode> Port_Done;
+    sc_inout_rv<32> Port_Data;
+
+    /* Bus snooping ports. */
+    sc_in_rv<32>             Port_BusAddr;
+    sc_in<int>               Port_BusWriter;
+    sc_in<Function>          Port_BusValid;
+
+    sc_inout_rv<32>          Port_CtoCData;
+    sc_inout_rv<1>           Port_doIHave;
+    sc_out_rv<3>             Port_Provider;
+
+    /* Bus requests ports. */
+    sc_port<Bus_if> Port_Bus;
+
+    /* Variables. */
+    int cache_id;
+    bool snooping;
+
+    int cache_lookup(int address, int mode);
+    int lru_line(int set_no);
+    void update_lru_state(int set_no, int j);
+    data_lookup coherence_lookup(int address, Function Func);
+    
+    /* Constructor. */
+    SC_CTOR(Cache) 
+    {
+        /* Create threads for handling data and snooping the bus. */
+        // this is very important, and is the heart of assignment 2: to have two independent threads, one to snoop the bus, and the other to handle data.
+        // your code should be mainly to implement these two threads.
+        SC_THREAD(bus);
+        SC_THREAD(execute);
+
+        /* Listen to clock.*/
+        sensitive << Port_CLK.pos();
+        dont_initialize();  // decide to use this functionality or not for your threads. Refer to SC_THREAD help.
+    
+        // create and initialize your variables/private members here
+        cache_set  = new l1_cache_set[N_SET];
+
+        // Set tag = 1
+        for (int i = 0; i < N_SET; ++i)
+        {
+            for (int j = 0; j < ASSOCIATIVITY; ++j)
+            {
+                cache_set[i].way[j].tag = 0xfffff;   // init all tag bits to 1
+                cache_set[i].way[j].line_state = INVALID;
+            }
+        }
+
+    }
+
+    /* destructor. */    
+    ~Cache() {
+        delete[] cache_set;
+    }
+private:
+    // define your cache structure here, and add a state to each line indicating the cache-coherence protocol
+    l1_cache_set *cache_set;
+    int data;
+
+    /* Thread that handles the bus. */
+    void bus() 
+    {
+        /* Continue while snooping is activated. */
+        while(snooping)
+        {
+           wait(Port_BusValid.value_changed_event());
+
+            Port_CtoCData.write("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+            Port_doIHave.write("Z");
+            Port_Provider.write("ZZZ");
+
+            data_lookup my_matched_data;
+            my_matched_data.data = 0xffffffff;
+            my_matched_data.line_state = INVALID;
+
+            int snoop_addr = Port_BusAddr.read().to_int();
+
+            /* Possibilities. */
+            switch(Port_BusValid.read())
+            {
+                // your code of what to do while snooping the bus
+                // keep in mind that a certain cache should distinguish between bus requests made by itself and requests made by other caches.
+                // count and report the total number of read/write operations on the bus, 
+                // in which the desired address (by other caches) is found in the snooping cache (probe read hits and probe write hits).
+                case F_INVALID: // Invalid request
+                    break;
+
+                case F_READ: // BusRd request 
+                    if(Port_BusWriter.read() == cache_id) {
+                        // own cache request
+                        cout << "\t@" << sc_time_stamp() << ": Cache " <<cache_id << " snoops own read req \n";
+                    }
+                    else {
+                        // Bus read : Respond if you have data in state M/O/E
+                        my_matched_data = coherence_lookup(snoop_addr, F_READ);
+                    }
+                    break;
+
+                case F_READX: // Bus ReadX request
+                    if(Port_BusWriter.read() == cache_id) {
+                        // own cache request
+                        cout << "\t@" << sc_time_stamp() << ": Cache " <<cache_id << " snoops own write req \n";
+                    }
+                    else {
+                        // Bus readx from other cache
+                        my_matched_data = coherence_lookup(snoop_addr, F_READX);
+                    }
+                    break;
+
+                case F_UPGRADE:
+                    if(Port_BusWriter.read() == cache_id) {
+                        // own cache request
+                        cout << "\t@" << sc_time_stamp() << ": Cache " <<cache_id << " snoops own readx req \n";
+                    }
+                    else {
+                        my_matched_data = coherence_lookup(snoop_addr, F_UPGRADE);
+                    }
+                    break;
+
+                default:
+              
+                    cout << "\n\n@" << sc_time_stamp() << ": ------------ Error in snooping bus request ---------\n";
+                    break;
+            }
+
+            if(my_matched_data.data != 0xffffffff){
+                if( my_matched_data.line_state == MODIFIED || my_matched_data.line_state == OWNED ||
+                    my_matched_data.line_state == EXCLUSIVE ) {
+
+                    int tag = (snoop_addr & 4294963200U) >> 12;
+                    int set_no = (snoop_addr & 4064) >> 5;
+
+                    cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " writing Addr " << my_matched_data.address
+                        << " value " << my_matched_data.data << " Tag: " << tag 
+                        << " Set no : " << set_no << " STATE: " << my_matched_data.line_state << " in Port_CtoCData to donate\n";
+
+                    Port_CtoCData.write(my_matched_data.data);
+                    Port_doIHave.write(1);
+                    Port_Provider.write(cache_id);
+                }
+                else if(my_matched_data.line_state == SHARED ){
+                    cout <<"\t@" << sc_time_stamp() << ": C" << cache_id << " enabling shared signal \n";
+
+                    Port_doIHave.write(1);
+                }
+                //wait();
+            }
+        }
+    }
+
+    /* Thread that handles the data requests. */
+    void execute() 
+    {
+        //* Begin loop. */
+        while(true)
+        {
+            /* wait for something to do... */
+            wait(Port_Func.value_changed_event());
+
+            /* Read or write? */
+            int f = Port_Func.read();
+
+            /* Read address. */
+            int addr = Port_Addr.read();
+            /* Calculate block and set, can also be done using bitshifts */
+            // code that implements the cache, and send bus requests.
+            data   = 0;
+            int cache_data;
+
+            if (f == F_READ) 
+            {
+                cache_data = cache_lookup(addr, READ_MODE);
+                Port_Data.write(cache_data);
+                cout << "\t@" << sc_time_stamp() << ": Cache " << cache_id << " writing Port_Done \n";
+                Port_Done.write( RET_READ_DONE );
+                wait();
+                Port_Data.write("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+            }
+            else if(f == F_WRITE)
+            {
+                data = Port_Data.read().to_int();
+                cache_data = cache_lookup(addr, WRITE_MODE);
+                cout << "\t@" << sc_time_stamp() << ": Cache " << cache_id << " writing Port_Done \n";
+                Port_Done.write( RET_WRITE_DONE );
+                wait();
+            }
+            else {
+                Port_Done.write( RET_WRITE_DONE );
+                wait();
+            }
+        }
+    }
+};
+
+
+// Member function definitions
+int Cache::cache_lookup(int address, int mode)
+{
+    int set_no = (address & 4064) >> 5 ;      // 0b111111100000 = 4064
+    unsigned int tag_no  = (address & 4294963200U) >> 12; // 0xfffff000 = 4294963200
+    int word_in_line = (address & 28) >> 2;   // 0b11100 = 28
+    int intended_data = 0;
+    bool found = false, copy_exist = false;
+    Line_State line_state;
+        
+    cout << "\t@" << sc_time_stamp() << ": cache lookup. Tag: " << tag_no
+        << " Set no : " << set_no << endl;
+    if (mode == 0) 
+    {
+        // Read mode
+        for (int i = 0; i < ASSOCIATIVITY; ++i)
+        {
+            line_state = cache_set[set_no].way[i].line_state;
+            if( (line_state != INVALID) && (found == false) ){
+                
+                if (cache_set[set_no].way[i].tag == tag_no) 
+                {
+                    cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " Read hit  " << "Tag: " << tag_no 
+                        << " Set no: " << set_no << endl;
+                    intended_data = cache_set[set_no].way[i].data[word_in_line];
+                    stats_readhit(cache_id);
+                    update_lru_state(set_no, i);
+                    found = true;
+                    wait();
+                    break;
+                }
+            }
+        }
+        if (found == false)
+        {
+
+            copy_exist = Port_Bus->read(cache_id, address);
+
+            stats_readmiss(cache_id);
+
+            if(Port_CtoCData.read().to_int() != -1 && copy_exist && Port_CtoCData.read() != ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ){
+                /* Wow..! Some other cache has provided the data*/
+                ++CtoCtransfers;
+                cout << "\t@" << sc_time_stamp() << ":C" << cache_id << " Read miss " 
+                        << address  << " Tag: " << tag_no << " Set no: " << set_no << endl;
+
+                
+                intended_data = Port_CtoCData.read().to_int();
+                if(DEBUG_COHERENCE)
+                    cout << "\t@" << sc_time_stamp() << ":C" << Port_Provider.read().to_uint() << " gave data: " 
+                        << intended_data << " addr: " << address << " to C:" << cache_id << " during BUS_READ" << 
+                        " Port_CtoCData.read() : " << Port_CtoCData.read() << endl;
+
+                Port_Bus->unlock_bus(cache_id);
+                /* Wait others to receive */
+
+                wait();
+            }
+            else {
+                Port_Bus->unlock_bus(cache_id);
+                cout << "\t@" << sc_time_stamp() << ":C" << cache_id << " Read miss for " << address << endl;
+                /* Bring data from memory */
+                wait(100);
+                intended_data = rand() % 1000;
+            }
+
+            // Use LRU to replace
+            int selected_way = lru_line(set_no);
+            cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " selected_way : " <<selected_way << endl;
+
+            cache_set[set_no].way[selected_way].data[word_in_line] = intended_data;
+
+            // Enable status bit, Set tag number
+            if(copy_exist){
+                cache_set[set_no].way[selected_way].line_state = SHARED;
+            }
+            else {
+                cache_set[set_no].way[selected_way].line_state = EXCLUSIVE;
+            }
+
+            cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " have read Addr: " << address << " in STATE:" 
+                    << cache_set[set_no].way[selected_way].line_state << endl;
+
+            cache_set[set_no].way[selected_way].tag = tag_no;
+            // Update LRU state
+            update_lru_state(set_no, selected_way);
+            found = true;
+                   
+            wait();
+        }
+        return intended_data;
+    }
+    else 
+    {   /* Write mode */
+        for (int i = 0; i < ASSOCIATIVITY; ++i)
+        {
+            if( (cache_set[set_no].way[i].line_state != INVALID) && (found == false) )
+            {
+                if (cache_set[set_no].way[i].tag == tag_no) 
+                {
+                    stats_writehit(cache_id);
+                    cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " Write hit  " << "Tag: " 
+                    << tag_no << " Set no: " << set_no << " STATE: " << cache_set[set_no].way[i].line_state << endl;
+
+                    if(cache_set[set_no].way[i].line_state == SHARED ||
+                        cache_set[set_no].way[i].line_state == OWNED)
+                        Port_Bus->upgrade(cache_id, address);   // Place BusUpgrade req
+
+                    cache_set[set_no].way[i].data[word_in_line] = data;
+                    cache_set[set_no].way[i].line_state = MODIFIED;
+
+                    cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " wrote Addr: " << address << " in STATE:" 
+                            << MODIFIED << endl;
+
+                    // Enable status bit, update LRU
+                    update_lru_state(set_no, i);
+                    found = true;
+                    wait();
+                    break; 
+                }   
+            }
+        }
+        if (found == false)
+        {
+            // Write miss.
+            cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " Write miss. " << "Tag: " 
+                << tag_no << " Set no: " << set_no << endl;
+            stats_writemiss(cache_id);
+
+            copy_exist = Port_Bus->readX(cache_id, address); // Place BusRdX req
+
+            if(Port_CtoCData.read() != -1 && copy_exist && Port_CtoCData.read() != ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ){
+                /* Wow..! Some other cache has provided the data*/
+                ++CtoCtransfers;
+                
+                intended_data = Port_CtoCData.read().to_int();
+                cout << "\t@" << sc_time_stamp() << ":C" << Port_Provider.read().to_uint() << " gave data: " 
+                    << intended_data << " addr: " << address << " to C:" << cache_id << " during BUS_READX"<<
+                        " Port_CtoCData.read() : " << Port_CtoCData.read() << endl;
+                Port_Bus->unlock_bus(cache_id);
+                /* Wait others to receive */
+                wait();
+            }
+            else {
+                Port_Bus->unlock_bus(cache_id);
+                cout << "\t@" << sc_time_stamp() << ":C" << cache_id << " Write miss for " << address << endl;
+                /* Bring data from memory */
+                wait(100);
+                intended_data = rand() % 1000;
+            }
+
+            // Use LRU to replace
+            int selected_way = lru_line(set_no);
+            cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " selected_way to write: " << selected_way << endl;
+            cache_set[set_no].way[selected_way].data[word_in_line] = intended_data;
+            
+            cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " wrote Addr: " << address << " in STATE:" 
+                    << MODIFIED << endl;
+            // Enable status bit
+            cache_set[set_no].way[selected_way].line_state = MODIFIED;
+            update_lru_state(set_no, selected_way);
+            found = true;
+            cache_set[set_no].way[selected_way].tag = tag_no;
+
+            wait();
+        }
+        return 0;
+    }
+}
+
+int Cache::lru_line(int set_no){
+    int present_state = cache_set[set_no].lru;
+    int victim;
+
+    // Check if any way has invalid data
+    for (int i = 0; i < ASSOCIATIVITY; ++i)
+    {
+        if(cache_set[set_no].way[i].line_state == INVALID){
+            return i;
+        }
+    }
+
+    cout << "present_state : " << present_state << endl;
+
+    if( (present_state & 11) == 0)
+    {
+        victim = 0;
+    } else if( (present_state & 11) == 8 )
+    {
+        victim = 1;
+    } else if ( (present_state & 19) == 2 )
+    {
+        victim = 2;
+    } else if ( (present_state & 19) == 18 )
+    {
+        victim = 3;
+    } else if ( (present_state & 37) == 1 )
+    {
+        victim = 4;
+    } else if ( (present_state & 37) == 33 )
+    {
+        victim = 5;
+    } else if ( (present_state & 69 ) == 5 )
+    {
+        victim = 6;
+    } else if ( (present_state & 69 ) == 69 )
+    {
+        victim = 7;
+    }
+    else {
+        cout << "\n---------- Error in finding out LRU line ---------- \n";
+        
+        victim = -1;  
+    }
+    if(cache_set[set_no].way[victim].line_state == MODIFIED ||
+        cache_set[set_no].way[victim].line_state == OWNED || 
+        cache_set[set_no].way[victim].line_state == EXCLUSIVE){
+        /* Copy data to memory before evict the line */
+        cout << "\t@" << sc_time_stamp() << ": C" << cache_id << " Evicting location in STATE" 
+            << cache_set[set_no].way[victim].line_state << endl;
+
+        wait(100);
+    }
+    return victim;
+}
+
+void Cache::update_lru_state(int set_no, int j){
+    cout << "\tupdate_lru_state : " << j << endl;
+    switch(j) {
+        case 0: // L0 is replaced. Next state ---1-11
+            cache_set[set_no].lru = cache_set[set_no].lru | 11;
+            break;
+        case 1: // L1 is replaced. Next state ---0-11
+            cache_set[set_no].lru = cache_set[set_no].lru | 3; //-----11
+            cache_set[set_no].lru = cache_set[set_no].lru & 119; // ---0---
+            break;
+        case 2: // L2 is replaced. Next state --1--01
+            cache_set[set_no].lru = cache_set[set_no].lru | 17; // --1---1
+            cache_set[set_no].lru = cache_set[set_no].lru & 125; // -----0-
+            break;
+        case 3: // L3 is replaced. Next state --0--01
+              cache_set[set_no].lru = cache_set[set_no].lru | 1; // ------1
+              cache_set[set_no].lru = cache_set[set_no].lru & 109; // -----0-
+              break;
+        case 4: // L4 is replaced. Next state -1--1-0
+              cache_set[set_no].lru = cache_set[set_no].lru | 36; // -1--1--
+              cache_set[set_no].lru = cache_set[set_no].lru & 126; // ------0
+              break;
+        case 5: // L5 is replaced. Next state -0--1-0
+              cache_set[set_no].lru = cache_set[set_no].lru | 4; // ----1--
+              cache_set[set_no].lru = cache_set[set_no].lru & 94; // -0----0
+              break;
+        case 6: // L6 is replaced. Next state 1---0-0
+              cache_set[set_no].lru = cache_set[set_no].lru | 64; // 1------
+              cache_set[set_no].lru = cache_set[set_no].lru & 122; // ----0-0
+              break;
+        case 7: // L7 is replaced. Next state 0---0-0    
+              cache_set[set_no].lru = cache_set[set_no].lru & 58; // 0---0-0   
+              break;
+        default:
+              cout << "\n---------- Error in updating next LRU state ---------- \n";
+              
+              break;
+    }
+    cout << "\tupdated state : " << cache_set[set_no].lru << endl;
+}
+
+data_lookup Cache::coherence_lookup(int address, Cache::Function Func){
+    int set_no = (address & 4064) >> 5 ;      // 0b111111100000 = 4064
+    unsigned int tag_no  = (address & 4294963200U) >> 12; // 0xfffff000 = 4294963200
+    int word_in_line = (address & 28) >> 2;   // 0b11100 = 28
+    bool found = false;
+    data_lookup found_data;
+    found_data.data = 0xffffffff;
+    found_data.address = 0xffffffff;
+    found_data.line_state = INVALID;
+
+    for (int i = 0; i < ASSOCIATIVITY; ++i)
+    {
+        if( (cache_set[set_no].way[i].line_state != INVALID) && (found == false) )
+        {
+            if( cache_set[set_no].way[i].tag == tag_no )
+            {
+                found_data.line_state = cache_set[set_no].way[i].line_state;
+                found_data.data = cache_set[set_no].way[i].data[word_in_line];
+                found_data.address = address;
+                cout << "\t@" << sc_time_stamp() << ": Cache " << cache_id << " found data " << found_data.data 
+                    << " at " << address << " in state " << found_data.line_state << " while snooping " << Func << "\n";
+
+                /* Change the line state */
+                switch(Func){
+                    case F_READ:
+                        probeRead++;
+                        if(found_data.line_state == MODIFIED || found_data.line_state == EXCLUSIVE){
+                            cache_set[set_no].way[i].line_state = OWNED;
+                        }
+                        break;
+
+                    case F_READX:
+                        probeWrite++;
+                        cache_set[set_no].way[i].line_state = INVALID;
+                        break;
+
+                    case F_UPGRADE:
+                        probeWrite++;
+                        cache_set[set_no].way[i].line_state = INVALID;
+                        found_data.data = 0xffffffff;
+                        if(cache_set[set_no].way[i].line_state  == MODIFIED){
+                            cout << "\n\n Error @" << sc_time_stamp() << ": Cache " << cache_id 
+                                << "snooped BUS_UPGRAD while haveing MODIFIED copy\n";
+                        }
+                        break;
+
+                    default:
+                        cout << "\n\n@" << sc_time_stamp() << ": Error. Invalid coherence lookup by cache - " 
+                            << cache_id << " Addr " << address << "\n\n";
+                }
+                
+                found = true;
+                return found_data;
+            }
+        }
+    }
+    return found_data;
+
+}
+
+/* Bus class, provides a way to share one memory in multiple CPU + Caches. */
+class Bus : public Bus_if, public sc_module {
+    public:
+        /* Ports andkkk  vb Signals. */
+        sc_in<bool> Port_CLK;
+        sc_out<Cache::Function> Port_BusValid;
+        sc_out<int> Port_BusWriter;
+
+        sc_signal_rv<32>    Port_BusAddr;
+        sc_in_rv<32>        Port_CtoCData;
+        sc_in_rv<1>         Port_doIHave;
+        sc_in_rv<3>         Port_Provider;
+
+        /* Bus mutex. */
+        sc_mutex bus;
+
+        /* Variables. */
+        long waits;
+        long reads;
+        long upgrades;
+        long readXs;
+        long consistency_waits;
+
+    public:
+        /* Constructor. */
+        SC_CTOR(Bus) {
+            /* Handle Port_CLK to simulate delay */
+            sensitive << Port_CLK.pos();
+
+            // Initialize some bus properties
+            Port_BusAddr.write("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+
+            /* Update variables. */
+            waits = 0;
+            reads = 0;
+            upgrades = 0;
+            readXs = 0;
+            consistency_waits = 0; 
+
+        }
+
+        ~Bus() {
+
+        }
+
+        virtual bool unlock_bus(int writer){
+            /* Reset. */
+            Port_BusValid.write(Cache::F_INVALID);
+            Port_BusAddr.write("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+
+            cout << "\t@" << sc_time_stamp() << ": C" << writer << " released bus\n";
+
+            bus.unlock();
+            return true;
+        }
+
+        /* Perform a read access to memory addr for CPU #writer. */
+        virtual bool read(int writer, int addr)
+        {
+
+            /* Try to get exclusive lock on bus. */
+            while(bus.trylock() == -1){
+                /* Wait when bus is in contention. */
+                waits++;
+                wait();
+            }
+            cout << "\t@" << sc_time_stamp() << ": C" << writer << " locked bus with READ req\n";
+            /* Update number of bus accesses. */
+            reads++;
+
+            /* Set lines. */
+            Port_BusAddr.write(addr);
+            Port_BusWriter.write(writer);
+            Port_BusValid.write(Cache::F_READ);
+
+            /* Wait for everyone to recieve. */
+            wait();
+            
+            if(Port_doIHave.read() == 1){
+                return true;
+            }
+            return false;
+        };
+
+        /* Perform a read access to memory addr for CPU #writer. */
+        virtual bool readX(int writer, int addr){
+
+            /* Try to get exclusive lock on bus. */
+            while(bus.trylock() == -1){
+                /* Wait when bus is in contention. */
+                waits++;
+                wait();
+            }
+
+            cout << "\t@" << sc_time_stamp() << ": C" << writer << " locked bus with READX req\n";
+
+            /* Update number of bus accesses. */
+            readXs++;
+
+            /* Set lines. */
+            Port_BusAddr.write(addr);
+            Port_BusWriter.write(writer);
+            Port_BusValid.write(Cache::F_READX); // 3 -> read exclusive
+
+            /* Wait for everyone to recieve. */
+            wait();
+
+            if(Port_doIHave.read() == 1){
+                return true;
+            }
+            return false;
+        };
+
+        /* Perform a read access to memory addr for CPU #writer. */
+        virtual bool upgrade(int writer, int addr){
+
+            /* Try to get exclusive lock on bus. */
+            while(bus.trylock() == -1){
+                /* Wait when bus is in contention. */
+                waits++;
+                wait();
+            }
+
+            cout << "\t@" << sc_time_stamp() << ": C" << writer << " locked bus with UPGRADE req\n";
+
+            /* Update number of bus accesses. */
+            upgrades++;
+
+            /* Set lines. */
+            Port_BusAddr.write(addr);
+            Port_BusWriter.write(writer);
+            Port_BusValid.write(Cache::F_READX); // 3 -> read exclusive
+
+            /* Wait for everyone to recieve. */
+            wait();
+
+            Port_BusValid.write(Cache::F_INVALID);
+            Port_BusAddr.write("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+            bus.unlock();
+
+            return true;
+        };
+
+        /* Bus output. */
+        void output(){
+            /* Write output as specified in the assignment. */
+            double avg = (double)waits / double(reads + upgrades + readXs);
+            long double exe_time = sc_time_stamp().value()/1000;
+            printf("\n 2. Main memory access rates\n");
+            printf("    Bus had %ld reads and %ld upgrades and %ld readX.\n", reads, upgrades, readXs);
+            printf("    A total of %ld accesses.\n", reads + upgrades + readXs);
+            printf("\n 3. Average time for bus acquisition\n");
+            printf("    There were %ld waits for the bus.\n", waits);
+            printf("    Average waiting time per access: %f cycles.\n", avg);
+            printf("\n 4. There were %d Cache to Cache transfers", CtoCtransfers);
+            //printf("\n 5. %d addresses found while snooping bus requests ", desired_addresses);
+            printf("\n 5. Total execution time is %ld ns, Avg per-mem-access time is %Lf ns\n", (long int)exe_time, exe_time/ double(reads + upgrades + readXs));
+            printf("\n 6. Probe Read: %d, \tProbe ReadX: %d\n", probeRead, probeWrite);
+        }
+};
+
+SC_MODULE(CPU) 
+{
+    public:
+        sc_in<bool>                Port_CLK;
+        sc_in<Cache::RetCode>     Port_MemDone;
+        sc_out<Cache::Function>   Port_MemFunc;
+        sc_out<int>                Port_MemAddr;
+        sc_inout_rv<32>            Port_MemData;
+        int cpu_id;
+
+        sc_out< sc_uint<2> > Mem_Func_Trace;
+
+        SC_CTOR(CPU) 
+        {
+            SC_THREAD(execute);
+            sensitive << Port_CLK.pos();
+            dont_initialize();
+        }
+
+    private:
+        void execute() 
+        {
+
+            TraceFile::Entry tr_data;
+            Cache::Function f;  //Cache::Function f;
+            int addr, data;
+
+            while(!tracefile_ptr->eof())
+            {
+                if(!tracefile_ptr->next(cpu_id, tr_data)){
+                    cerr << "Error reading trace for CPU" << endl;                   
+                    break;
+                }
+
+                addr = tr_data.addr;
+
+                switch(tr_data.type){
+                    case TraceFile::ENTRY_TYPE_READ:
+                        cout << "@" << sc_time_stamp() << ": P" << cpu_id << ": Read from " << addr << endl;
+                        f = Cache::F_READ;
+                        break;
+                    case TraceFile::ENTRY_TYPE_WRITE:
+                        cout << "@" << sc_time_stamp() << ": P" << cpu_id << ": Write to " << addr << endl;
+                        f = Cache::F_WRITE;
+                        break;
+                    case TraceFile::ENTRY_TYPE_NOP:
+                        f = Cache::F_INVALID;
+                        break;
+                    default:
+                        cerr << "Error got invalid data from Trace" << endl;
+                        cout << "@" << sc_time_stamp() << ": Error got invalid data from Trace" << endl;
+                        exit(0);
+                }
+
+                if(f != Cache::F_INVALID){
+                    Port_MemAddr.write(addr);
+                    Port_MemFunc.write(f);
+
+                    (f == Cache::F_READ) ? (Mem_Func_Trace.write(1)) : (Mem_Func_Trace.write(2));
+
+                    if (f == Cache::F_WRITE) 
+                    {
+                        data = rand() % 1000;
+                        Port_MemData.write(data);
+                        wait();
+                        Port_MemData.write("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+                    }
+
+                    wait(Port_MemDone.value_changed_event());
+                               
+                }
+                // Advance one cycle in simulated time 
+                wait();
+            }
+
+            --pending_processors;
+            if(pending_processors == 0){
+                cout << "@" << sc_time_stamp() << ": Terminating simulation : " 
+                    << sc_time_stamp().value()/1000 ;
+                sc_stop();
+            }
+        
+        }
+};
+
+
+int sc_main(int argc, char* argv[])
+{
+        // Get the tracefile argument and create Tracefile object
+        // This function sets tracefile_ptr and num_cpus
+        init_tracefile(&argc, &argv);
+
+        // supress warnings & multiple driver issue
+        sc_report_handler::set_actions(SC_ID_MORE_THAN_ONE_SIGNAL_DRIVER_, SC_DO_NOTHING);
+        sc_report_handler::set_actions( SC_ID_LOGIC_X_TO_BOOL_, SC_LOG);
+        sc_report_handler::set_actions( SC_ID_VECTOR_CONTAINS_LOGIC_VALUE_, SC_LOG);
+
+        // Initialize statistics counters
+        stats_init();
+
+        pending_processors = num_cpus;
+        CtoCtransfers = 0;
+        probeWrite = 0, probeRead =0;
+        
+
+        /* Create clock. */
+        sc_clock clk;
+
+        /* Create Bus and TraceFile Syncronizer. */
+        Bus  bus("bus");
+
+         sc_trace_file *wf =sc_create_vcd_trace_file("MOESI-Protocol");
+
+        /* Connect to Clock. */
+        bus.Port_CLK(clk);
+
+        /* Cpu and Cache pointers. */
+        Cache* cache[num_cpus];
+        CPU* cpu[num_cpus];
+
+        /* Signals Cache/CPU. */
+        sc_buffer<Cache::Function>  sigMemFunc[num_cpus];
+        sc_buffer<Cache::RetCode>   sigMemDone[num_cpus];
+        sc_signal_rv<32>            sigMemData[num_cpus];
+        sc_signal<int>              sigMemAddr[num_cpus];
+
+        /* Signals Chache/Bus. */
+        sc_signal<int>              sigBusWriter;
+        sc_signal<Cache::Function>  sigBusValid;
+        sc_signal_rv<1>             sigDoIHave;
+        sc_signal_rv<32>            sigCtoCData;
+        sc_signal_rv<3>             sigProvider;
+
+        sc_signal< sc_uint<2> > Sig_Mem_Func_Trace[num_cpus];
+
+        /* General Bus signals. */
+        bus.Port_BusWriter(sigBusWriter);
+        bus.Port_BusValid(sigBusValid);
+        bus.Port_CtoCData(sigCtoCData);
+        bus.Port_doIHave(sigDoIHave);
+        bus.Port_Provider(sigProvider);
+
+        /* Create and connect all caches and cpu's. */
+        for(unsigned int i = 0; i < num_cpus; i++)
+        {
+            /* Each process should have a unique string name. */
+            char name_cache[12];
+            char name_cpu[12];
+
+            char mem_func[15];
+            char mem_data[15];
+            char mem_done[15];
+            char mem_addr[15];
+
+            /* Use number in unique string name. */
+            //name_cache << "cache_" << i;
+            //name_cpu   << "cpu_"   << i;
+            sprintf(name_cache, "cache_%d", i);
+            sprintf(name_cpu, "cpu_%d", i);
+
+            /* Create CPU and Cache. */
+            cache[i] = new Cache(name_cache);
+            cpu[i] = new CPU(name_cpu);
+
+            /* Set ID's. */
+            cpu[i]->cpu_id = i;
+            cache[i]->cache_id = i;
+            cache[i]->snooping = true;
+
+            /* Cache to Bus. */
+            cache[i]->Port_BusAddr(bus.Port_BusAddr);
+            cache[i]->Port_BusWriter(sigBusWriter);
+            cache[i]->Port_BusValid(sigBusValid);
+            cache[i]->Port_Bus(bus);
+
+            /* Cache to CPU. */
+            cache[i]->Port_Func(sigMemFunc[i]);
+            cache[i]->Port_Addr(sigMemAddr[i]);
+            cache[i]->Port_Data(sigMemData[i]);
+            cache[i]->Port_Done(sigMemDone[i]);
+
+            /* Cache to Cache communication */
+            cache[i]->Port_CtoCData(sigCtoCData);
+            cache[i]->Port_doIHave(sigDoIHave);
+            cache[i]->Port_Provider(sigProvider);
+
+            /* CPU to Cache. */
+            cpu[i]->Port_MemFunc(sigMemFunc[i]);
+            cpu[i]->Port_MemAddr(sigMemAddr[i]);
+            cpu[i]->Port_MemData(sigMemData[i]);
+            cpu[i]->Port_MemDone(sigMemDone[i]);
+
+            cpu[i]->Mem_Func_Trace(Sig_Mem_Func_Trace[i]);
+
+            sprintf(mem_func, "sigMemFunc_%d", i);
+            sprintf(mem_data, "sigMemData%d", i);
+            sprintf(mem_done, "sigMemDone%d", i);
+            sprintf(mem_addr, "sigMemAddr%d", i);
+
+            sc_trace(wf, Sig_Mem_Func_Trace[i], mem_func); // 01 -> Read operation. 10 -> Write operation
+            sc_trace(wf, sigMemAddr[i], mem_addr);
+            sc_trace(wf, sigMemData[i], mem_data);
+            //sc_trace(wf, sigMemDone[i], mem_done);
+
+            /* Set Clock */
+            cache[i]->Port_CLK(clk);
+            cpu[i]->Port_CLK(clk);
+        }
+
+        // Dump the desired signals
+        sc_trace(wf, clk, "clock");
+        sc_trace(wf, bus.Port_BusAddr, "Bus_Addr");
+        sc_trace(wf, bus.Port_BusWriter, "Port_BusWriter");
+        //sc_trace(wf, sigBusValid, "sigBusValid");
+
+        /* Start Simulation. */
+        sc_start();
+        stats_print();
+        bus.output();
+
+
+        sc_close_vcd_trace_file(wf);
+
+        return 1;
+}
+
+
